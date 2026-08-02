@@ -1,0 +1,16 @@
+resources:
+  pipelines:
+    opensky_silver:
+      name: opensky_silver
+      catalog: ${var.catalog}
+      schema: silver
+      serverless: true
+      continuous: false
+      edition: ADVANCED
+      libraries:
+        - file:
+            path: ../../src/pipelines/silver/opensky_state.sql
+      tags:
+        layer: silver
+        source: opensky
+        processing_mode: triggered_streaming

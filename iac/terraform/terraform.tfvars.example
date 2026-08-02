@@ -1,0 +1,6 @@
+# Defaults already match the Free Edition development environment.
+# Copy only the values that need to differ in your workspace.
+
+catalog_name      = "dev_alh"
+raw_volume_name   = "raw_files"
+secret_scope_name = "aerolakehouse-dev"

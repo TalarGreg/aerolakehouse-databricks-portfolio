@@ -1,0 +1,30 @@
+bundle:
+  name: aerolakehouse
+
+include:
+  - resources/jobs/*.yml
+  - resources/pipelines/*.yml
+
+variables:
+  catalog:
+    description: Unity Catalog catalog name
+    default: dev_alh
+  job_pause_status:
+    description: Deployment-safe schedule state; set to UNPAUSED only after validation
+    default: PAUSED
+
+# Only runtime files are synchronized to ${workspace.file_path}.
+sync:
+  paths:
+    - configs
+    - notebooks
+    - sql
+    - src
+
+targets:
+  dev:
+    mode: development
+    default: true
+    variables:
+      catalog: dev_alh
+      job_pause_status: PAUSED

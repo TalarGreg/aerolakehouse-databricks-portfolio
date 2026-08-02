@@ -1,0 +1,135 @@
+# Bronze end-to-end ingestion job.
+#
+# Topology (5 phases):
+#   Phase 1 — INGEST (parallel): pull raw files into the Volume, one task per source notebook.
+#   Phase 2 — LOAD: run_bronze_ingestion loads the Volume into Bronze Delta tables.
+#             run_if ALL_DONE — runs even if some Phase 1 ingests fail, so a partial
+#             outage still gets whatever data did land. Failed ingest tasks stay red
+#             in the Job Runs UI (visibility requirement).
+#   Phase 3 — VALIDATE: validate_bronze_freshness asserts audit + freshness for the run.
+#             Default run_if ALL_SUCCESS — only validates when the load succeeded.
+#
+#   Phase 4 - SILVER: refresh_opensky_silver incrementally processes unread Bronze commits.
+#   Phase 5 - VALIDATE SILVER: validate_opensky_silver checks the current update output.
+#
+# Compute: no job_clusters are declared, so tasks run on serverless compute. This is the
+# only option on Databricks Free Edition. Parallel Phase 1 tasks share the serverless
+# pool; if capacity is exceeded they are queued (and effectively serialized) rather than
+# failing — no topology change required.
+#
+# Trigger: every 20 minutes, deployed paused by default.
+resources:
+  jobs:
+    bronze_ingestion_e2e:
+      name: bronze_ingestion_e2e
+      description: >
+        End-to-end Bronze pipeline: ingest raw files from external APIs into Volumes,
+        load them into Bronze Delta tables, validate freshness, and incrementally
+        refresh the OpenSky Silver streaming tables.
+      max_concurrent_runs: 1
+      schedule:
+        quartz_cron_expression: "0 */20 * * * ?"
+        timezone_id: UTC
+        # Public deployments are paused by default. Enable only after secrets,
+        # quotas, bootstrap tables, and target permissions are verified.
+        pause_status: ${var.job_pause_status}
+      tags:
+        layer: bronze
+        scope: e2e
+
+      tasks:
+        # ---------- Phase 1: parallel ingest ----------
+        - task_key: ingest_opensky
+          timeout_seconds: 600
+          max_retries: 3
+          min_retry_interval_millis: 30000
+          notebook_task:
+            notebook_path: ${workspace.file_path}/notebooks/bronze_opensky_ingest
+            base_parameters:
+              catalog: ${var.catalog}
+
+        - task_key: ingest_open_weather_map
+          timeout_seconds: 600
+          max_retries: 3
+          min_retry_interval_millis: 30000
+          notebook_task:
+            notebook_path: ${workspace.file_path}/notebooks/bronze_open_weather_map_ingest
+            base_parameters:
+              catalog: ${var.catalog}
+
+        - task_key: ingest_aviationstack
+          timeout_seconds: 600
+          max_retries: 3
+          min_retry_interval_millis: 30000
+          notebook_task:
+            notebook_path: ${workspace.file_path}/notebooks/bronze_aviationstack_ingest
+            base_parameters:
+              catalog: ${var.catalog}
+
+        - task_key: ingest_awc
+          timeout_seconds: 600
+          max_retries: 3
+          min_retry_interval_millis: 30000
+          notebook_task:
+            notebook_path: ${workspace.file_path}/notebooks/bronze_awc_ingest
+            base_parameters:
+              catalog: ${var.catalog}
+
+        - task_key: ingest_our_air_ports
+          timeout_seconds: 600
+          max_retries: 3
+          min_retry_interval_millis: 30000
+          notebook_task:
+            notebook_path: ${workspace.file_path}/notebooks/bronze_our_air_ports_ingest
+            base_parameters:
+              catalog: ${var.catalog}
+
+        # ---------- Phase 2: load into Bronze ----------
+        - task_key: run_bronze_ingestion
+          timeout_seconds: 1800
+          run_if: ALL_DONE
+          depends_on:
+            - task_key: ingest_opensky
+            - task_key: ingest_open_weather_map
+            - task_key: ingest_aviationstack
+            - task_key: ingest_awc
+            - task_key: ingest_our_air_ports
+          notebook_task:
+            notebook_path: ${workspace.file_path}/notebooks/bronze/run_bronze_ingestion
+            base_parameters:
+              catalog: ${var.catalog}
+
+        # ---------- Phase 3: validate freshness ----------
+        - task_key: validate_bronze_freshness
+          timeout_seconds: 300
+          run_if: ALL_SUCCESS
+          depends_on:
+            - task_key: run_bronze_ingestion
+          notebook_task:
+            notebook_path: ${workspace.file_path}/notebooks/tests/validate_bronze_freshness
+            base_parameters:
+              catalog: ${var.catalog}
+              # Freshness reference: the moment this job run started (UTC).
+              # If the template is not resolved at runtime, the notebook falls back
+              # to MIN(start_ts) from the audit table for this pipeline_run_id.
+              run_ts: "{{job.start_time.iso_datetime}}"
+
+        # ---------- Phase 4: refresh OpenSky Silver ----------
+        - task_key: refresh_opensky_silver
+          timeout_seconds: 1800
+          depends_on:
+            - task_key: validate_bronze_freshness
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.opensky_silver.id}
+            full_refresh: false
+
+        # ---------- Phase 5: validate OpenSky Silver ----------
+        - task_key: validate_opensky_silver
+          timeout_seconds: 300
+          depends_on:
+            - task_key: refresh_opensky_silver
+          notebook_task:
+            notebook_path: ${workspace.file_path}/notebooks/tests/validate_opensky_silver
+            base_parameters:
+              catalog: ${var.catalog}
+              run_ts: "{{job.start_time.iso_datetime}}"

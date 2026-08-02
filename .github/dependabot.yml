@@ -1,0 +1,25 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    labels:
+      - dependencies
+      - github-actions
+
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: monthly
+    labels:
+      - dependencies
+      - python
+
+  - package-ecosystem: terraform
+    directory: /iac/terraform
+    schedule:
+      interval: monthly
+    labels:
+      - dependencies
+      - terraform

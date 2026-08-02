@@ -1,0 +1,146 @@
+sources:
+  - source_name: opensky
+    file_format: json
+    load_mode: append
+    input_path: /Volumes/{catalog}/bronze/raw_files/opensky/
+    target_table: "{catalog}.bronze.raw_opensky_states"
+    schema_location: /Volumes/{catalog}/bronze/raw_files/_schemas/opensky
+    checkpoint_location: /Volumes/{catalog}/bronze/raw_files/_checkpoints/opensky
+    schema_hints: "states ARRAY<STRUCT<icao24 STRING, callsign STRING, origin_country STRING, time_position BIGINT, last_contact BIGINT, longitude DOUBLE, latitude DOUBLE, baro_altitude DOUBLE, on_ground BOOLEAN, velocity DOUBLE, true_track DOUBLE, vertical_rate DOUBLE, sensors STRING, geo_altitude DOUBLE, squawk STRING, spi BOOLEAN, position_source INT, category INT>>"
+    flatten:
+      mode: opensky_states
+      top_level_columns: [ingest_ts, api_time, states_count]
+    reader_options:
+      multiline: "true"
+
+  - source_name: aviationstack
+    file_format: json
+    load_mode: append
+    input_path: /Volumes/{catalog}/bronze/raw_files/aviationstack/
+    target_table: "{catalog}.bronze.raw_aviationstack_flights"
+    schema_location: /Volumes/{catalog}/bronze/raw_files/_schemas/aviationstack
+    checkpoint_location: /Volumes/{catalog}/bronze/raw_files/_checkpoints/aviationstack
+    schema_hints: "departures ARRAY<STRUCT<flight_date STRING, flight_status STRING, departure STRUCT<airport STRING, iata STRING, icao STRING, scheduled STRING, estimated STRING, actual STRING, delay STRING, gate STRING, terminal STRING, timezone STRING>, arrival STRUCT<airport STRING, iata STRING, icao STRING, scheduled STRING, estimated STRING, actual STRING, delay STRING, gate STRING, terminal STRING, baggage STRING, timezone STRING>, airline STRUCT<name STRING, iata STRING, icao STRING>, flight STRUCT<number STRING, iata STRING, icao STRING>, aircraft STRUCT<registration STRING, iata STRING, icao STRING, icao24 STRING>>>, arrivals ARRAY<STRUCT<flight_date STRING, flight_status STRING, departure STRUCT<airport STRING, iata STRING, icao STRING, scheduled STRING, estimated STRING, actual STRING, delay STRING, gate STRING, terminal STRING, timezone STRING>, arrival STRUCT<airport STRING, iata STRING, icao STRING, scheduled STRING, estimated STRING, actual STRING, delay STRING, gate STRING, terminal STRING, baggage STRING, timezone STRING>, airline STRUCT<name STRING, iata STRING, icao STRING>, flight STRUCT<number STRING, iata STRING, icao STRING>, aircraft STRUCT<registration STRING, iata STRING, icao STRING, icao24 STRING>>>"
+    flatten:
+      explode_columns:
+        - column: departures
+          direction_value: departure
+        - column: arrivals
+          direction_value: arrival
+      direction_column: flight_direction
+      top_level_columns: [ingest_ts, airport_iata]
+      nested_fields:
+        departure: [airport, iata, icao, scheduled, estimated, actual, delay, gate, terminal, timezone]
+        arrival: [airport, iata, icao, scheduled, estimated, actual, delay, gate, terminal, baggage, timezone]
+        airline: [name, iata, icao]
+        flight: [number, iata, icao]
+        aircraft: [registration, iata, icao, icao24]
+    reader_options:
+      multiline: "true"
+
+  - source_name: open_weather_map_current
+    file_format: json
+    load_mode: append
+    input_path: /Volumes/{catalog}/bronze/raw_files/open_weather_map/
+    target_table: "{catalog}.bronze.raw_owm_current"
+    schema_location: /Volumes/{catalog}/bronze/raw_files/_schemas/owm_current
+    checkpoint_location: /Volumes/{catalog}/bronze/raw_files/_checkpoints/owm_current
+    # schema_hints forces correct struct type for "current" and "city" — Auto Loader
+    # infers both as STRING without hints. Delete _schemas/owm_current if changing hints.
+    schema_hints: "current STRUCT<dt BIGINT, visibility BIGINT, name STRING, main STRUCT<temp DOUBLE, feels_like DOUBLE, temp_min DOUBLE, temp_max DOUBLE, pressure BIGINT, humidity BIGINT>, wind STRUCT<speed DOUBLE, deg BIGINT, gust DOUBLE>, clouds STRUCT<all BIGINT>, sys STRUCT<country STRING, sunrise BIGINT, sunset BIGINT>, weather ARRAY<STRUCT<main STRING, description STRING, icon STRING>>>, city STRUCT<name STRING, country STRING>"
+    flatten:
+      mode: single_record
+      source_column: current
+      top_level_columns: [ingest_ts, airport, latitude, longitude]
+      nested_fields:
+        main: [temp, feels_like, temp_min, temp_max, pressure, humidity]
+        wind: [speed, deg, gust]
+        clouds: [all]
+        sys: [country, sunrise, sunset]
+      array_first_fields:
+        weather: [main, description, icon]
+      scalar_fields: [dt, visibility, name]
+      city_fields: [name, country]
+    reader_options:
+      multiline: "true"
+
+  - source_name: open_weather_map_forecast
+    file_format: json
+    load_mode: append
+    input_path: /Volumes/{catalog}/bronze/raw_files/open_weather_map/
+    target_table: "{catalog}.bronze.raw_owm_forecast"
+    schema_location: /Volumes/{catalog}/bronze/raw_files/_schemas/owm_forecast
+    checkpoint_location: /Volumes/{catalog}/bronze/raw_files/_checkpoints/owm_forecast
+    schema_hints: "forecast ARRAY<STRUCT<dt BIGINT, dt_txt STRING, visibility BIGINT, pop DOUBLE, main STRUCT<temp DOUBLE, feels_like DOUBLE, temp_min DOUBLE, temp_max DOUBLE, pressure BIGINT, humidity BIGINT>, wind STRUCT<speed DOUBLE, deg BIGINT, gust DOUBLE>, clouds STRUCT<all BIGINT>, sys STRUCT<pod STRING>, rain STRUCT<`3h` DOUBLE>, weather ARRAY<STRUCT<main STRING, description STRING, icon STRING>>>>"
+    flatten:
+      explode_column: forecast
+      top_level_columns: [ingest_ts, airport, latitude, longitude]
+      nested_fields:
+        main: [temp, feels_like, temp_min, temp_max, pressure, humidity]
+        wind: [speed, deg, gust]
+        clouds: [all]
+        sys: [pod]
+        rain: ["3h"]
+      array_first_fields:
+        weather: [main, description]
+      scalar_fields: [dt, dt_txt, visibility, pop]
+    reader_options:
+      multiline: "true"
+
+  # METAR has a dedicated Bronze contract. TAF, PIREP, and SIGMET are retained
+  # in the raw landing Volume until product-specific contracts are implemented.
+  - source_name: awc_metar
+    file_format: json
+    load_mode: append
+    input_path: /Volumes/{catalog}/bronze/raw_files/awc/product=metar/
+    target_table: "{catalog}.bronze.raw_awc_metar"
+    schema_location: /Volumes/{catalog}/bronze/raw_files/_schemas/awc_metar
+    checkpoint_location: /Volumes/{catalog}/bronze/raw_files/_checkpoints/awc_metar
+    schema_hints: "data ARRAY<STRUCT<icaoId STRING, name STRING, lat DOUBLE, lon DOUBLE, elev DOUBLE, obsTime STRING, temp DOUBLE, dewp DOUBLE, wdir STRING, wspd DOUBLE, altim DOUBLE, visib DOUBLE, fltCat STRING, cover STRING, wxString STRING, metarType STRING, qcField BIGINT, rawOb STRING, receiptTime STRING, reportTime STRING, clouds ARRAY<STRUCT<cover STRING, base BIGINT, type STRING>>>>"
+    flatten:
+      explode_column: data
+      top_level_columns: [ingest_ts, count, hours]
+      scalar_fields: [icaoId, name, lat, lon, elev, obsTime, temp, dewp, wdir, wspd, altim, visib, fltCat, cover, wxString, metarType, qcField, rawOb, receiptTime, reportTime]
+      keep_as_struct: [clouds]
+    reader_options:
+      multiline: "true"
+
+  - source_name: our_airports_airports
+    file_format: csv
+    load_mode: copy_into
+    input_path: /Volumes/{catalog}/bronze/raw_files/our_airports/dataset=airports/
+    target_table: "{catalog}.bronze.raw_our_airports_airports"
+    schema_location: ""
+    checkpoint_location: ""
+    reader_options:
+      header: "true"
+
+  - source_name: our_airports_runways
+    file_format: csv
+    load_mode: copy_into
+    input_path: /Volumes/{catalog}/bronze/raw_files/our_airports/dataset=runways/
+    target_table: "{catalog}.bronze.raw_our_airports_runways"
+    schema_location: ""
+    checkpoint_location: ""
+    reader_options:
+      header: "true"
+
+  - source_name: our_airports_countries
+    file_format: csv
+    load_mode: copy_into
+    input_path: /Volumes/{catalog}/bronze/raw_files/our_airports/dataset=countries/
+    target_table: "{catalog}.bronze.raw_our_airports_countries"
+    schema_location: ""
+    checkpoint_location: ""
+    reader_options:
+      header: "true"
+
+  - source_name: our_airports_regions
+    file_format: csv
+    load_mode: copy_into
+    input_path: /Volumes/{catalog}/bronze/raw_files/our_airports/dataset=regions/
+    target_table: "{catalog}.bronze.raw_our_airports_regions"
+    schema_location: ""
+    checkpoint_location: ""
+    reader_options:
+      header: "true"

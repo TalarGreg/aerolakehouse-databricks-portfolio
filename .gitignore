@@ -1,0 +1,36 @@
+# Databricks local state
+.databricks/
+
+# Terraform local artifacts and pre-HCP migration backups
+**/.terraform/
+**/.legacy-state-previous-workspace/
+**/terraform.tfstate
+**/terraform.tfstate.*
+**/*.tfvars
+**/*.tfplan
+**/tfplan
+crash.log
+crash.*.log
+
+# Local secrets and credentials
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python local artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

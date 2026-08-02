@@ -1,0 +1,343 @@
+name: Deploy development
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Run remote plans only or deploy the planned changes
+        required: true
+        default: plan
+        type: choice
+        options:
+          - plan
+          - deploy
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: deploy-development
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Credential-free preflight
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    uses: ./.github/workflows/ci.yml
+
+  prepare:
+    name: Prepare deployment
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      deploy_required: ${{ steps.gate.outputs.deploy_required }}
+      operation: ${{ steps.gate.outputs.operation }}
+      target_sha: ${{ steps.gate.outputs.target_sha }}
+
+    steps:
+      - name: Evaluate deployment gate
+        id: gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          UPSTREAM_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          UPSTREAM_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          UPSTREAM_EVENT: ${{ github.event.workflow_run.event }}
+          MANUAL_OPERATION: ${{ inputs.operation }}
+          AUTOMATIC_DEPLOYMENT_ENABLED: ${{ vars.ENABLE_AUTOMATIC_DEPLOYMENT }}
+        run: |
+          set -euo pipefail
+
+          deploy_required="true"
+          operation="${MANUAL_OPERATION}"
+          reason="Manual ${operation} requested for current main."
+
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_run" ]]; then
+            operation="deploy"
+
+            if [[ "${AUTOMATIC_DEPLOYMENT_ENABLED}" != "true" ]]; then
+              deploy_required="false"
+              reason="Automatic deployment is disabled for this repository."
+            elif [[ "${UPSTREAM_EVENT}" != "push" ]]; then
+              deploy_required="false"
+              reason="Upstream CI event is ${UPSTREAM_EVENT}, not push."
+            elif [[ "${UPSTREAM_BRANCH}" != "main" ]]; then
+              deploy_required="false"
+              reason="Upstream CI branch is ${UPSTREAM_BRANCH}, not main."
+            elif [[ "${UPSTREAM_CONCLUSION}" != "success" ]]; then
+              deploy_required="false"
+              reason="Upstream CI conclusion is ${UPSTREAM_CONCLUSION}."
+            fi
+          elif [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "Manual development deployment must run from main, not ${GITHUB_REF}."
+            exit 1
+          fi
+
+          if [[ "${deploy_required}" == "true" ]]; then
+            remote_main_sha="$(
+              gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha'
+            )"
+
+            if [[ "${TARGET_SHA}" != "${remote_main_sha}" ]]; then
+              if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+                echo "The selected commit is no longer the current main HEAD."
+                echo "Start a new workflow run for the latest main commit."
+                exit 1
+              fi
+
+              deploy_required="false"
+              reason="CI commit ${TARGET_SHA} is stale; current main is ${remote_main_sha}."
+            fi
+          fi
+
+          if [[ "${deploy_required}" == "true" && "${GITHUB_EVENT_NAME}" == "workflow_run" ]]; then
+            associated_pr="$(
+              gh api "repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}/pulls" \
+                --jq '.[0].number // empty'
+            )"
+
+            if [[ -n "${associated_pr}" ]]; then
+              changed_files="$(
+                gh api --paginate \
+                  "repos/${GITHUB_REPOSITORY}/pulls/${associated_pr}/files" \
+                  --jq '.[] | .filename, (.previous_filename // empty)'
+              )"
+            else
+              changed_files=""
+            fi
+
+            deployable_files="$(
+              printf '%s\n' "${changed_files}" |
+                grep -Ev '\.md$' |
+                grep -E '^(databricks\.yml|configs/|iac/terraform/|notebooks/|resources/|sql/|src/)' ||
+                true
+            )"
+
+            if [[ -z "${deployable_files}" ]]; then
+              if [[ -n "${associated_pr}" ]]; then
+                deploy_required="false"
+                reason="PR #${associated_pr} changed no deployment paths."
+              else
+                reason="No associated PR found; deploying direct push conservatively."
+              fi
+            else
+              reason="PR #${associated_pr} changed deployment paths."
+              printf '%s\n' "${deployable_files}"
+            fi
+          fi
+
+          echo "deploy_required=${deploy_required}" >> "${GITHUB_OUTPUT}"
+          echo "operation=${operation}" >> "${GITHUB_OUTPUT}"
+          echo "target_sha=${TARGET_SHA}" >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "## AeroLakehouse deployment gate"
+            echo
+            echo "- Trigger: \`${GITHUB_EVENT_NAME}\`"
+            echo "- Operation: \`${operation}\`"
+            echo "- Commit: \`${TARGET_SHA}\`"
+            echo "- Deployment required: \`${deploy_required}\`"
+            echo "- Decision: ${reason}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  deploy:
+    name: Plan or deploy development
+    needs:
+      - validate
+      - prepare
+    if: >-
+      ${{
+        always() &&
+        needs.prepare.result == 'success' &&
+        needs.prepare.outputs.deploy_required == 'true' &&
+        (
+          github.event_name == 'workflow_run' ||
+          needs.validate.result == 'success'
+        )
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: dev
+    env:
+      TF_CLOUD_ORGANIZATION: ${{ vars.TF_CLOUD_ORGANIZATION }}
+      TF_WORKSPACE: ${{ vars.TF_WORKSPACE }}
+
+    steps:
+      - name: Check out exact commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.prepare.outputs.target_sha }}
+          persist-credentials: false
+
+      - name: Require current main commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ needs.prepare.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+
+          remote_main_sha="$(
+            gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha'
+          )"
+
+          if [[ "${TARGET_SHA}" != "${remote_main_sha}" ]]; then
+            echo "Deployment commit ${TARGET_SHA} is no longer current main."
+            exit 1
+          fi
+
+      - name: Verify deployment configuration
+        shell: bash
+        env:
+          TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}
+          TF_CLOUD_ORGANIZATION: ${{ vars.TF_CLOUD_ORGANIZATION }}
+          TF_WORKSPACE: ${{ vars.TF_WORKSPACE }}
+          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          missing=()
+          [[ -n "${TF_TOKEN_app_terraform_io}" ]] || missing+=("TF_API_TOKEN")
+          [[ -n "${TF_CLOUD_ORGANIZATION}" ]] || missing+=("TF_CLOUD_ORGANIZATION")
+          [[ -n "${TF_WORKSPACE}" ]] || missing+=("TF_WORKSPACE")
+          [[ -n "${DATABRICKS_HOST}" ]] || missing+=("DATABRICKS_HOST")
+          [[ -n "${DATABRICKS_TOKEN}" ]] || missing+=("DATABRICKS_TOKEN")
+
+          if (( ${#missing[@]} > 0 )); then
+            printf 'Missing GitHub deployment configuration: %s\n' "${missing[*]}"
+            exit 1
+          fi
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.15.8"
+          terraform_wrapper: false
+
+      - name: Set up Databricks CLI
+        uses: databricks/setup-cli@dd60b7b133203edca3e8f08b1e053c43a979296e # v1.8.0
+        with:
+          version: "1.8.0"
+
+      - name: Report tool versions
+        run: |
+          terraform version
+          databricks version
+
+      - name: Initialize Terraform with HCP state
+        working-directory: iac/terraform
+        env:
+          TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}
+        run: terraform init -input=false
+
+      - name: Verify expected Terraform state
+        shell: bash
+        working-directory: iac/terraform
+        env:
+          TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          state="$(terraform state list)"
+          required_addresses=(
+            'data.databricks_catalog.dev'
+            'data.databricks_current_user.me'
+            'databricks_schema.schemas["bronze"]'
+            'databricks_schema.schemas["gold"]'
+            'databricks_schema.schemas["monitoring"]'
+            'databricks_schema.schemas["silver"]'
+            'databricks_secret_scope.dev'
+            'databricks_volume.raw_files'
+          )
+
+          for address in "${required_addresses[@]}"; do
+            if ! grep -Fqx "${address}" <<< "${state}"; then
+              echo "Expected Terraform state address is missing: ${address}"
+              exit 1
+            fi
+          done
+
+          echo "Verified ${#required_addresses[@]} expected Terraform state addresses."
+
+      - name: Create Terraform plan
+        working-directory: iac/terraform
+        env:
+          TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}
+          DATABRICKS_AUTH_TYPE: pat
+          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: terraform plan -input=false -no-color -out=tfplan
+
+      - name: Reject destructive Terraform plan
+        shell: bash
+        working-directory: iac/terraform
+        run: |
+          set -euo pipefail
+
+          destructive_changes="$(
+            terraform show -json tfplan |
+              jq '[.resource_changes[]? | select(.change.actions | index("delete"))] | length'
+          )"
+
+          if (( destructive_changes > 0 )); then
+            echo "Terraform plan contains ${destructive_changes} destructive change(s)."
+            echo "Automated deletion and replacement are blocked."
+            exit 1
+          fi
+
+      - name: Apply exact Terraform plan
+        if: ${{ needs.prepare.outputs.operation == 'deploy' }}
+        working-directory: iac/terraform
+        env:
+          TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}
+          DATABRICKS_AUTH_TYPE: pat
+          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: terraform apply -input=false -auto-approve tfplan
+
+      - name: Validate Databricks bundle
+        env:
+          DATABRICKS_AUTH_TYPE: pat
+          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: databricks bundle validate --target dev
+
+      - name: Plan Databricks bundle
+        env:
+          DATABRICKS_AUTH_TYPE: pat
+          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: databricks bundle plan --target dev
+
+      - name: Deploy Databricks bundle
+        if: ${{ needs.prepare.outputs.operation == 'deploy' }}
+        env:
+          DATABRICKS_AUTH_TYPE: pat
+          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: databricks bundle deploy --target dev
+
+      - name: Publish deployment summary
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          {
+            echo "## AeroLakehouse development deployment"
+            echo
+            echo "- Trigger: \`${GITHUB_EVENT_NAME}\`"
+            echo "- Operation: \`${{ needs.prepare.outputs.operation }}\`"
+            echo "- Commit: \`${{ needs.prepare.outputs.target_sha }}\`"
+            echo "- Result: \`${{ job.status }}\`"
+            echo "- Bronze job run requested: no"
+          } >> "${GITHUB_STEP_SUMMARY}"
